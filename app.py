@@ -9,11 +9,13 @@ from src.data import load_excel_curves
 from src.models import EQUATIONS, equation_name_map
 from src.fitting import fit_curve_iterative
 from src.plotting import plot_curve_comparison
+from src.evaluation import r2_score
+from src.scaling import scale_xy, unscale_params, scale_params
 
 st.set_page_config(page_title="Curve Fitter ABC", layout="wide")
 
 st.title("Curve Fitter ABC")
-st.caption("Ajuste de parámetros A, B, C para modelos ABC (Old/New) con múltiples curvas.")
+st.caption("Ajuste de parámetros A, B, C para modelos ABC (Old/New) con múltiples curvas. Incluye reescalado/desescalado de X/Y.")
 
 # ---------------------------
 # Estado de sesión (persistencia)
@@ -33,7 +35,6 @@ if "curve_to_plot" not in st.session_state:
 @st.cache_data
 def load_excel_curves_cached(file_bytes: bytes) -> dict:
     """Carga y normaliza el Excel desde bytes y devuelve dict {sheet: DataFrame(x,y)}."""
-    # Acepta bytes para que sea cacheable; internamente pandas maneja el objeto.
     return load_excel_curves(io.BytesIO(file_bytes))
 
 # ---------------------------
@@ -52,18 +53,17 @@ with st.sidebar:
     eq_key = equation_name_map[eq_display]  # "abc_old" o "abc_new"
     model = EQUATIONS[eq_key]
 
-    st.subheader("Parámetros iniciales (opcional)")
+    st.subheader("Parámetros iniciales (escala ORIGINAL)")
     a0 = st.number_input("A inicial", value=1.0, step=0.1, format="%.2f", key="a0")
     b0 = st.number_input("B inicial", value=1.0, step=0.1, format="%.2f", key="b0")
-    # ✅ Opción 1: defaults negativos para C
+    # Defaults solicitados para C
     c0 = st.number_input("C inicial", value=-1.0, step=0.1, format="%.2f", key="c0")
 
-    st.subheader("Límites (bounds)")
+    st.subheader("Límites (bounds) en escala ORIGINAL")
     a_min = st.number_input("A min", value=1e-12, step=0.1, format="%.2f", key="a_min")
-    a_max = st.number_input("A max", value=1e15, step=0.1, format="%.2f", key="a_max")
+    a_max = st.number_input("A max", value=1e12, step=0.1, format="%.2f", key="a_max")
     b_min = st.number_input("B min", value=1e-12, step=0.1, format="%.2f", key="b_min")
-    b_max = st.number_input("B max", value=1e15, step=0.1, format="%.2f", key="b_max")
-    # ✅ Opción 1: bounds negativos para C
+    b_max = st.number_input("B max", value=1e12, step=0.1, format="%.2f", key="b_max")
     c_min = st.number_input("C min", value=-10.0, step=0.1, format="%.2f", key="c_min")
     c_max = st.number_input("C max", value=-0.3, step=0.1, format="%.2f", key="c_max")
 
@@ -74,6 +74,11 @@ with st.sidebar:
     max_iter = st.slider("Iteraciones máximas", min_value=1, max_value=20, value=10, help="Número máximo de reintentos por curva.", key="max_iter")
     jitter_pct = st.slider("Jitter inicial (%)", min_value=0, max_value=50, value=20, help="Magnitud de aleatoriedad para reintentos.", key="jitter_pct")
     random_seed = st.number_input("Random seed", value=42, step=1, help="Para reproducibilidad.", key="seed")
+
+    st.subheader("Reescalado (opcional)")
+    use_scaling = st.checkbox("Reescalar X/Y automáticamente", value=True, key="use_scaling")
+    scale_method = st.selectbox("Método de escala de X", options=["p95", "max"], index=0, help="Usa percentil 95 o máximo de X.", key="scale_method")
+    scale_y_flag = st.checkbox("Escalar Y (recomendado)", value=True, key="scale_y_flag")
 
 # ---------------------------
 # 1) Carga de archivo Excel
@@ -88,7 +93,7 @@ uploaded = st.file_uploader(
 if uploaded is not None:
     try:
         curves = load_excel_curves_cached(uploaded.getvalue())
-        st.session_state.curves = curves  # ✅ persistir
+        st.session_state.curves = curves  # persistir
     except Exception as e:
         st.error(f"No se pudo leer el archivo: {e}")
         st.stop()
@@ -116,42 +121,73 @@ if run_fit and st.session_state.curves is not None:
         x = df["x"].to_numpy(dtype=float)
         y = df["y"].to_numpy(dtype=float)
 
-        fit_out = fit_curve_iterative(
-            x=x,
-            y=y,
-            model=model,
-            init_params={"a": a0, "b": b0, "c": c0},
-            bounds={"a": (a_min, a_max), "b": (b_min, b_max), "c": (c_min, c_max)},
-            target_r2=target_r2,
-            max_iter=max_iter,
-            jitter_pct=jitter_pct,
-            random_seed=int(random_seed),
-            method="least_squares",
-            loss="soft_l1",
-        )
+        if use_scaling:
+            # 1) Reescalar X/Y
+            x_s, y_s, sx, sy = scale_xy(x, y, method_x=scale_method, scale_y=scale_y_flag)
 
-        # ---------------------------
-        # Aceptar éxito por R² objetivo
-        # ---------------------------
-        if fit_out["r2"] >= target_r2:
-            fit_out["success"] = True
-            fit_out["message"] = f"Objetivo alcanzado R² ({fit_out['r2']:.6f})."
-        
-        elif fit_out["message"] == "`xtol` termination condition is satisfied.":
-            fit_out["success"] = False
-            fit_out["message"] = "El optimizador convergio sin alcanzar el Objetivo R²"
-            
-        elif fit_out["message"] == "`ftol` termination condition is satisfied.":
-            fit_out["success"] = False
-            fit_out["message"] = "El optimizador no convergio"
+            # 2) Iniciales y bounds en escala escalada
+            init_scaled = scale_params(eq_key, a0, b0, c0, sx, sy)
+            bounds_scaled = {
+                "a": (1e-6, 10.0),
+                "b": (1e-6, 1e3),
+                "c": (c_min, c_max),
+            }
 
-        elif fit_out["message"] == "Both `ftol` and `xtol` termination conditions are satisfied.":
-            fit_out["success"] = False
-            fit_out["message"] = "El optimizador no convergio"
+            # 3) Ajustar en escala escalada
+            fit_scaled = fit_curve_iterative(
+                x=x_s,
+                y=y_s,
+                model=model,
+                init_params=init_scaled,
+                bounds=bounds_scaled,
+                target_r2=target_r2,
+                max_iter=max_iter,
+                jitter_pct=jitter_pct,
+                random_seed=int(random_seed),
+                method="least_squares",
+                loss="soft_l1",
+            )
 
-        elif fit_out["message"].find("Fit aborted")!=-1:
-            fit_out["message"] = "Abortado: Limite de evaluaciones permitido"
-            
+            # Aceptar éxito por R²
+            if fit_scaled["r2"] >= target_r2:
+                fit_scaled["success"] = True
+                fit_scaled["message"] = f"Reached target R² ({fit_scaled['r2']:.6f})."
+
+            # 4) Desescalar parámetros y evaluar en escala original
+            p_s = fit_scaled["params"]
+            params_unscaled = unscale_params(eq_key, p_s["a"], p_s["b"], p_s["c"], sx, sy)
+            y_hat = model(x, **params_unscaled)
+            r2_orig = r2_score(y, y_hat)
+
+            fit_out = {
+                "params": params_unscaled,
+                "r2": float(r2_orig),
+                "success": fit_scaled["success"],
+                "nfev": fit_scaled["nfev"],
+                "message": fit_scaled["message"],
+            }
+
+        else:
+            # Sin reescalado: flujo original
+            fit_out = fit_curve_iterative(
+                x=x,
+                y=y,
+                model=model,
+                init_params={"a": a0, "b": b0, "c": c0},
+                bounds={"a": (a_min, a_max), "b": (b_min, b_max), "c": (c_min, c_max)},
+                target_r2=target_r2,
+                max_iter=max_iter,
+                jitter_pct=jitter_pct,
+                random_seed=int(random_seed),
+                method="least_squares",
+                loss="soft_l1",
+            )
+            if fit_out["r2"] >= target_r2:
+                fit_out["success"] = True
+                fit_out["message"] = f"Reached target R² ({fit_out['r2']:.6f})."
+            y_hat = model(x, **fit_out["params"])
+
+        # Registrar resultados en escala ORIGINAL
         results_rows.append({
             "curve": curve_name,
             "equation": eq_display,
@@ -164,26 +200,26 @@ if run_fit and st.session_state.curves is not None:
             "message": fit_out["message"],
         })
 
-        y_hat = model(x, **fit_out["params"])
         fitted_series[curve_name] = pd.DataFrame({"x": x, "y": y, "y_hat": y_hat}).sort_values("x")
 
+    # Crear DataFrame final
     results_df = pd.DataFrame(results_rows).sort_values(["success", "R2", "curve"], ascending=[False, False, True])
-    
-    # ------- Cálculo de B′ por ecuación -------
+
+    # ------- Insertar B′ directamente en results_df (escala ORIGINAL) -------
     if eq_key == "abc_old":
-        # B' = B^(-1/C)
         bprime = np.power(results_df["B"].astype(float), -1.0 / results_df["C"].astype(float))
     else:  # abc_new
-        # B' = 1 / B^C
         bprime = 1.0 / np.power(results_df["B"].astype(float), results_df["C"].astype(float))
 
-    results_df.insert(results_df.columns.get_loc("B") + 1, "B'", bprime)
+    # Insertamos la nueva columna a la derecha de B
+    insert_pos = results_df.columns.get_loc("B") + 1
+    results_df.insert(insert_pos, "B'", bprime)
 
-    # ✅ Persistir resultados y series
+    # Persistir
     st.session_state.results_df = results_df
     st.session_state.fitted_series = fitted_series
 
-    # ✅ Selección por defecto para el gráfico
+    # Selección por defecto para el gráfico
     if not st.session_state.curve_to_plot and len(fitted_series) > 0:
         st.session_state.curve_to_plot = list(fitted_series.keys())[0]
 
@@ -194,6 +230,7 @@ if st.session_state.results_df is not None:
     st.markdown("### 3) Resultados")
     st.dataframe(st.session_state.results_df, use_container_width=True)
 
+    # ---- Descarga Excel (una sola hoja con B′ incluido) ----
     st.markdown("#### Descargar resultados (Excel)")
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
@@ -212,7 +249,6 @@ if st.session_state.results_df is not None:
     st.markdown("### 4) Visualización")
 
     options = list(st.session_state.fitted_series.keys())
-    # índice que respeta la última selección
     if st.session_state.curve_to_plot in options:
         default_index = options.index(st.session_state.curve_to_plot)
     else:
@@ -222,7 +258,7 @@ if st.session_state.results_df is not None:
         "Selecciona una curva para graficar",
         options=options,
         index=default_index,
-        key="curve_to_plot",  # ✅ mantiene selección
+        key="curve_to_plot",  # mantiene selección
     )
 
     dfp = st.session_state.fitted_series[curve_to_plot]
